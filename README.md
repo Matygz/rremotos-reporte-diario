@@ -1,5 +1,8 @@
 # Rremotos · Reporte diario de ventas y reposición
 
+> **Versión demo.** Por defecto corre con datos ficticios (`DEMO_MODE: true`) y no se conecta a ninguna cuenta real: se puede importar y
+probar sin credenciales. La conexión a Mercado Libre está implementada y se activa siguiendo [Puesta en marcha](#puesta-en-marcha).
+
 Workflow de **n8n** que todos los días junta las ventas del día anterior y el stock de todas las publicaciones de un vendedor de Mercado Libre, detecta qué publicaciones hay que recargar y manda un resumen por email. Corre local con Docker y no tiene costo.
 
 > Es el complemento de lectura de [RRemotosAPP](https://github.com/Matygz/RRemotosAPP-Demo): esa app **escribe** stock en Mercado Libre; este workflow solo **lee y analiza**. No modifica nada en la cuenta.
