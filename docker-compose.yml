@@ -1,0 +1,16 @@
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:1.112.6
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"   # solo accesible desde esta PC
+    environment:
+      - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
+      - TZ=America/Argentina/Buenos_Aires
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
+    volumes:
+      - n8n_data:/home/node/.n8n   # workflows, credenciales y ejecuciones
+
+volumes:
+  n8n_data:

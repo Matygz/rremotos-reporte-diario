@@ -1,0 +1,507 @@
+{
+  "name": "Rremotos · Reporte diario de ventas y reposición",
+  "nodes": [
+    {
+      "id": "c9297f30-48e1-543b-9373-e47e25a22b88",
+      "name": "Todos los días 14:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 14 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "52e1cb05-ddea-53f5-8b1d-1f4ecbca7b9a",
+      "name": "Ejecutar a mano",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "634f0552-85c5-5287-8337-227b64c2526e",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// ===================== EDITÁ ESTOS VALORES =====================\nconst CONFIG = {\n  DEMO_MODE: true,          // true = datos ficticios, no llama a Mercado Libre\n  ENVIAR_EMAIL: false,      // false = solo arma el reporte (útil para probar)\n  SELLER_ID: '',            // tu user_id de Mercado Libre (número)\n  EMAIL_DESTINO: 'destino@ejemplo.com',\n  EMAIL_REMITENTE: 'tu-cuenta@gmail.com',\n  UMBRAL_STOCK: 2,          // una variante está \"baja\" si tiene menos de este stock\n  MIN_VARIANTES_BAJAS: 2,   // se pide recarga si una publicación tiene al menos estas variantes bajas\n  ZONA_HORARIA: 'America/Argentina/Buenos_Aires',\n};\n// ===============================================================\n\n// Rango \"ayer\" completo en hora argentina, en el formato que espera la API de órdenes.\nconst hoy = DateTime.now().setZone(CONFIG.ZONA_HORARIA).startOf('day');\nconst ayer = hoy.minus({ days: 1 });\n\nreturn [{\n  json: {\n    ...CONFIG,\n    DESDE: ayer.toISO(),\n    HASTA: hoy.minus({ milliseconds: 1 }).toISO(),\n    FECHA_REPORTE: ayer.toFormat('dd/LL/yyyy'),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "10d9511c-96e4-51b6-a62f-c5fb1f5ca712",
+      "name": "¿Modo demo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        460,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "67c88e52-b687-531c-8e98-af2d1c695569",
+              "leftValue": "={{ $json.DEMO_MODE }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a872dfc-c281-560a-b459-d3ffd8f81c66",
+      "name": "Datos demo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        -60
+      ],
+      "parameters": {
+        "jsCode": "// Lógica del reporte diario. Funciones puras: se testean con `node --test`\n// y el script build_workflow.py las incrusta en los nodos Code de n8n.\n\nconst TALLE_RE = /talle|size|tamaño/i;\n\n/** Nombre legible de una variante: el talle si existe, si no la combinación completa. */\nfunction nombreVariante(variacion) {\n  const attrs = variacion.attribute_combinations || [];\n  const talle = attrs.find((a) => TALLE_RE.test(a.name || '') || a.id === 'SIZE');\n  if (talle && talle.value_name) return String(talle.value_name);\n  const valores = attrs.map((a) => a.value_name).filter(Boolean);\n  return valores.length ? valores.join(' / ') : String(variacion.id);\n}\n\n/** Lista de variantes {nombre, stock} de una publicación (sin variaciones = una sola). */\nfunction variantesDe(item) {\n  const vars = item.variations || [];\n  if (vars.length === 0) {\n    return [{ nombre: '(única)', stock: Number(item.available_quantity) || 0 }];\n  }\n  return vars.map((v) => ({ nombre: nombreVariante(v), stock: Number(v.available_quantity) || 0 }));\n}\n\n/** Ordena talles numéricos de menor a mayor y el resto alfabéticamente. */\nfunction ordenarVariantes(a, b) {\n  const na = Number(a.nombre);\n  const nb = Number(b.nombre);\n  if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;\n  return a.nombre.localeCompare(b.nombre, 'es');\n}\n\n/**\n * Regla de reposición (definida por el negocio):\n * una publicación con varias variantes necesita recarga cuando\n * MIN_VARIANTES_BAJAS o más variantes tienen menos de UMBRAL_STOCK unidades.\n * Las publicaciones de variante única se informan aparte cuando llegan a 0.\n */\nfunction analizarStock(items, config) {\n  const umbral = Number(config.UMBRAL_STOCK);\n  const minBajas = Number(config.MIN_VARIANTES_BAJAS);\n  const alertas = [];\n  const sinStock = [];\n  let variantesTotales = 0;\n\n  for (const item of items) {\n    const variantes = variantesDe(item);\n    variantesTotales += variantes.length;\n\n    if (variantes.length === 1) {\n      if (variantes[0].stock === 0) {\n        sinStock.push({ id: item.id, titulo: item.title, permalink: item.permalink || '' });\n      }\n      continue;\n    }\n\n    const bajas = variantes.filter((v) => v.stock < umbral).sort(ordenarVariantes);\n    if (bajas.length >= minBajas) {\n      alertas.push({\n        id: item.id,\n        titulo: item.title,\n        permalink: item.permalink || '',\n        pausada: item.status === 'paused',\n        bajas,\n        sinStock: bajas.filter((v) => v.stock === 0).length,\n        totalVariantes: variantes.length,\n      });\n    }\n  }\n\n  // Primero las más urgentes: más variantes en 0, después más variantes bajas.\n  alertas.sort((a, b) => b.sinStock - a.sinStock || b.bajas.length - a.bajas.length || a.titulo.localeCompare(b.titulo, 'es'));\n  return { alertas, sinStock, publicaciones: items.length, variantes: variantesTotales };\n}\n\n/** Resumen de ventas de un conjunto de órdenes de Mercado Libre (solo las pagadas). */\nfunction analizarVentas(orders, topN = 5) {\n  const pagadas = orders.filter((o) => o.status === 'paid');\n  const porProducto = new Map();\n  let unidades = 0;\n  let monto = 0;\n  let moneda = 'ARS';\n\n  for (const orden of pagadas) {\n    if (orden.currency_id) moneda = orden.currency_id;\n    for (const linea of orden.order_items || []) {\n      const cantidad = Number(linea.quantity) || 0;\n      const subtotal = cantidad * (Number(linea.unit_price) || 0);\n      unidades += cantidad;\n      monto += subtotal;\n\n      const item = linea.item || {};\n      const variante = (item.variation_attributes || [])\n        .map((a) => a.value_name)\n        .filter(Boolean)\n        .join(' / ');\n      const clave = `${item.id}|${item.variation_id || ''}`;\n      const actual = porProducto.get(clave) || { titulo: item.title || item.id, variante, unidades: 0, monto: 0 };\n      actual.unidades += cantidad;\n      actual.monto += subtotal;\n      porProducto.set(clave, actual);\n    }\n  }\n\n  const top = [...porProducto.values()]\n    .sort((a, b) => b.unidades - a.unidades || b.monto - a.monto)\n    .slice(0, topN);\n\n  return { ordenes: pagadas.length, unidades, monto: Math.round(monto), moneda, top };\n}\n\nfunction analizar({ items, orders, config }) {\n  return {\n    fecha: config.FECHA_REPORTE,\n    fuente: config.DEMO_MODE ? 'demo' : 'mercadolibre',\n    config: { umbral: Number(config.UMBRAL_STOCK), minBajas: Number(config.MIN_VARIANTES_BAJAS) },\n    ventas: analizarVentas(orders),\n    stock: analizarStock(items, config),\n  };\n}\n\n// ---------- Email ----------\n\nfunction escapar(texto) {\n  return String(texto)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n}\n\nfunction formatearMonto(monto, moneda) {\n  try {\n    return new Intl.NumberFormat('es-AR', { style: 'currency', currency: moneda, maximumFractionDigits: 0 }).format(monto);\n  } catch (e) {\n    return `${moneda} ${Math.round(monto).toLocaleString('es-AR')}`;\n  }\n}\n\nfunction plural(n, uno, varios) {\n  return `${n} ${n === 1 ? uno : varios}`;\n}\n\nfunction enlace(titulo, permalink) {\n  const t = escapar(titulo);\n  return permalink ? `<a href=\"${escapar(permalink)}\" style=\"color:#1a56db;text-decoration:none\">${t}</a>` : t;\n}\n\nfunction armarEmail(r) {\n  const { ventas, stock } = r;\n  const recargar = stock.alertas.length;\n  const asunto = `Rremotos · ${r.fecha} · ${plural(ventas.unidades, 'unidad vendida', 'unidades vendidas')} · ` +\n    (recargar ? `${plural(recargar, 'publicación', 'publicaciones')} para recargar` : 'stock OK');\n\n  const th = 'style=\"text-align:left;padding:6px 8px;border-bottom:2px solid #ddd;font-size:13px;color:#555\"';\n  const thNum = 'style=\"text-align:right;padding:6px 8px;border-bottom:2px solid #ddd;font-size:13px;color:#555\"';\n  const td = 'style=\"padding:6px 8px;border-bottom:1px solid #eee;font-size:14px;vertical-align:top\"';\n  const tdNum = 'style=\"padding:6px 8px;border-bottom:1px solid #eee;font-size:14px;text-align:right;white-space:nowrap\"';\n\n  const filasTop = ventas.top.map((p) =>\n    `<tr><td ${td}>${escapar(p.titulo)}${p.variante ? `<br><span style=\"color:#777;font-size:12px\">${escapar(p.variante)}</span>` : ''}</td>` +\n    `<td ${tdNum}>${p.unidades}</td><td ${tdNum}>${formatearMonto(p.monto, ventas.moneda)}</td></tr>`).join('');\n\n  const filasAlertas = stock.alertas.map((a) => {\n    const detalle = a.bajas\n      .map((v) => `<span style=\"display:inline-block;margin:0 6px 4px 0;padding:2px 6px;border-radius:4px;background:${v.stock === 0 ? '#fde2e2' : '#fff4d6'};font-size:13px\">${escapar(v.nombre)}: <b>${v.stock}</b></span>`)\n      .join('');\n    const pausa = a.pausada ? ' <span style=\"color:#b42318;font-size:12px\">(pausada)</span>' : '';\n    return `<tr><td ${td}>${enlace(a.titulo, a.permalink)}${pausa}</td><td ${td}>${detalle}</td></tr>`;\n  }).join('');\n\n  const listaSinStock = stock.sinStock.map((s) => `<li style=\"margin-bottom:4px\">${enlace(s.titulo, s.permalink)}</li>`).join('');\n\n  const seccionVentas = ventas.ordenes === 0\n    ? '<p style=\"margin:0 0 8px\">Ayer no hubo ventas pagadas.</p>'\n    : `<p style=\"margin:0 0 12px;font-size:15px\"><b>${plural(ventas.unidades, 'unidad', 'unidades')}</b> en ${plural(ventas.ordenes, 'orden', 'órdenes')} · <b>${formatearMonto(ventas.monto, ventas.moneda)}</b></p>\n       <table cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;border-collapse:collapse\">\n         <tr><th ${th}>Más vendidos</th><th ${thNum}>Unid.</th><th ${thNum}>Total</th></tr>\n         ${filasTop}\n       </table>`;\n\n  const seccionAlertas = recargar === 0\n    ? `<p style=\"margin:0\">Ninguna publicación tiene ${r.config.minBajas} o más talles con menos de ${r.config.umbral} unidades.</p>`\n    : `<table cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;border-collapse:collapse\">\n         <tr><th ${th}>Publicación</th><th ${th}>Talles con stock bajo</th></tr>\n         ${filasAlertas}\n       </table>`;\n\n  const seccionSinStock = stock.sinStock.length\n    ? `<h3 style=\"font-size:15px;margin:20px 0 8px\">Sin stock (variante única)</h3><ul style=\"margin:0;padding-left:18px\">${listaSinStock}</ul>`\n    : '';\n\n  const avisoDemo = r.fuente === 'demo'\n    ? '<p style=\"margin:0 0 16px;padding:8px 10px;background:#eef2ff;border-radius:6px;font-size:13px\">Modo demo: datos ficticios, sin conexión a Mercado Libre.</p>'\n    : '';\n\n  const html = `<!doctype html><html><body style=\"margin:0;padding:16px;background:#f6f6f6;font-family:Arial,Helvetica,sans-serif;color:#222\">\n  <div style=\"max-width:640px;margin:0 auto;background:#fff;border-radius:8px;padding:20px\">\n    <h2 style=\"margin:0 0 4px;font-size:20px\">Reporte diario · Rremotos</h2>\n    <p style=\"margin:0 0 16px;color:#666;font-size:13px\">Ventas del ${escapar(r.fecha)} · stock de ${plural(stock.publicaciones, 'publicación', 'publicaciones')} (${stock.variantes} variantes)</p>\n    ${avisoDemo}\n    <h3 style=\"font-size:16px;margin:0 0 8px\">Ventas de ayer</h3>\n    ${seccionVentas}\n    <h3 style=\"font-size:16px;margin:24px 0 4px\">Para recargar${recargar ? ` (${recargar})` : ''}</h3>\n    <p style=\"margin:0 0 10px;color:#666;font-size:12px\">Publicaciones con ${r.config.minBajas} o más talles con menos de ${r.config.umbral} unidades. En rojo, los talles en 0.</p>\n    ${seccionAlertas}\n    ${seccionSinStock}\n  </div></body></html>`;\n\n  const lineas = [\n    `Reporte diario Rremotos · ventas del ${r.fecha}`,\n    ventas.ordenes === 0\n      ? 'Ayer no hubo ventas pagadas.'\n      : `${plural(ventas.unidades, 'unidad', 'unidades')} en ${plural(ventas.ordenes, 'orden', 'órdenes')} · ${formatearMonto(ventas.monto, ventas.moneda)}`,\n    ...ventas.top.map((p) => `  - ${p.titulo}${p.variante ? ` (${p.variante})` : ''}: ${p.unidades}`),\n    '',\n    recargar ? `Para recargar (${recargar}):` : 'Stock OK: nada para recargar.',\n    ...stock.alertas.map((a) => `  - ${a.titulo}${a.pausada ? ' [pausada]' : ''}: ${a.bajas.map((v) => `${v.nombre}=${v.stock}`).join(', ')}`),\n    ...(stock.sinStock.length ? ['', 'Sin stock (variante única):', ...stock.sinStock.map((s) => `  - ${s.titulo}`)] : []),\n  ];\n\n  return { asunto, html, texto: lineas.join('\\n') };\n}\n\n// ---------- Datos demo ----------\n\n/** Generador pseudoaleatorio con semilla: el demo da siempre el mismo resultado para la misma fecha. */\nfunction crearRandom(semilla) {\n  let s = semilla >>> 0;\n  return () => {\n    s = (s * 1664525 + 1013904223) >>> 0;\n    return s / 4294967296;\n  };\n}\n\nfunction semillaDeFecha(fecha) {\n  return [...String(fecha)].reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 7);\n}\n\nfunction datosDemo(fecha) {\n  const rnd = crearRandom(semillaDeFecha(fecha));\n  const modelos = ['410', '512', '618', '733', '805', '920'];\n  const colores = ['NEGRO', 'BLANCO', 'AZUL', 'GRIS'];\n  const talles = ['35', '36', '37', '38', '39', '40', '41', '42', '43'];\n  const items = [];\n  let itemN = 1000001;\n  let varN = 5000001;\n\n  for (const modelo of modelos) {\n    for (const color of colores.slice(0, 2 + Math.floor(rnd() * 3))) {\n      const tallesPub = talles.filter(() => rnd() > 0.25);\n      const variations = tallesPub.map((talle) => {\n        // La mayoría arranca en 2 (stock base del negocio); algunas bajan a 1 o 0.\n        const r = rnd();\n        const stock = r < 0.05 ? 0 : r < 0.13 ? 1 : r < 0.9 ? 2 : 3;\n        return {\n          id: varN++,\n          available_quantity: stock,\n          attribute_combinations: [\n            { id: 'COLOR', name: 'Color', value_name: color[0] + color.slice(1).toLowerCase() },\n            { id: 'SIZE', name: 'Talle', value_name: talle },\n          ],\n        };\n      });\n      const total = variations.reduce((s, v) => s + v.available_quantity, 0);\n      items.push({\n        id: `MLA${itemN++}`,\n        title: `Zapatilla ${modelo} ${color}`,\n        status: total === 0 ? 'paused' : 'active',\n        permalink: '',\n        available_quantity: total,\n        variations,\n      });\n    }\n  }\n\n  // Dos publicaciones sin variaciones (accesorios) para cubrir ese caso.\n  items.push({ id: `MLA${itemN++}`, title: 'Plantillas de gel', status: 'active', permalink: '', available_quantity: 4, variations: [] });\n  items.push({ id: `MLA${itemN++}`, title: 'Cordones planos x2', status: 'paused', permalink: '', available_quantity: 0, variations: [] });\n\n  const conVariaciones = items.filter((i) => i.variations.length);\n  const orders = [];\n  const cantidadOrdenes = 6 + Math.floor(rnd() * 10);\n  for (let n = 0; n < cantidadOrdenes; n++) {\n    const item = conVariaciones[Math.floor(rnd() * conVariaciones.length)];\n    const v = item.variations[Math.floor(rnd() * item.variations.length)];\n    orders.push({\n      id: 2000000000 + n,\n      status: rnd() < 0.9 ? 'paid' : 'cancelled',\n      currency_id: 'ARS',\n      order_items: [{\n        item: { id: item.id, title: item.title, variation_id: v.id, variation_attributes: v.attribute_combinations },\n        quantity: rnd() < 0.85 ? 1 : 2,\n        unit_price: 38000 + Math.floor(rnd() * 8) * 2500,\n      }],\n    });\n  }\n\n  return { items, orders };\n}\n\nif (typeof module !== 'undefined' && module.exports) {\n  module.exports = { nombreVariante, variantesDe, analizarStock, analizarVentas, analizar, armarEmail, datosDemo };\n}\n\n// ---------- Nodo ----------\nconst config = $('Config').first().json;\nconst { items, orders } = datosDemo(config.FECHA_REPORTE);\nreturn [{ json: { items, orders, config } }];\n"
+      }
+    },
+    {
+      "id": "582b0080-43c9-5fd3-8176-194459f3dcca",
+      "name": "Estados a consultar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        220
+      ],
+      "parameters": {
+        "jsCode": "// Mercado Libre pausa sola una publicación cuando todo su stock llega a 0,\n// así que también hay que mirar las pausadas para no perder esas alertas.\nreturn ['active', 'paused'].map((status) => ({ json: { status } }));\n"
+      }
+    },
+    {
+      "id": "6592ecb8-0350-55b7-a320-d896591b49a9",
+      "name": "Buscar publicaciones",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        920,
+        220
+      ],
+      "parameters": {
+        "url": "=https://api.mercadolibre.com/users/{{ $('Config').first().json.SELLER_ID }}/items/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "={{ $json.status }}"
+            },
+            {
+              "name": "limit",
+              "value": "50"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "offset",
+                    "value": "={{ $pageCount * 50 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.results || $response.body.results.length < 50 }}",
+              "limitPagesFetched": true,
+              "maxRequests": 40,
+              "requestInterval": 300
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "c303ea73-1f42-58d0-95d2-4b34b16d0d79",
+      "name": "Lotes de 20",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        220
+      ],
+      "parameters": {
+        "jsCode": "// Junta los IDs de todas las páginas de búsqueda y los parte en lotes de 20,\n// el máximo que acepta el endpoint /items?ids= por llamada.\nconst ids = [...new Set($input.all().flatMap((i) => i.json.results || []))];\nconst lotes = [];\nfor (let i = 0; i < ids.length; i += 20) {\n  lotes.push({ json: { ids: ids.slice(i, i + 20).join(',') } });\n}\nif (lotes.length === 0) {\n  throw new Error('No se encontraron publicaciones activas ni pausadas. Revisá SELLER_ID y la credencial.');\n}\nreturn lotes;\n"
+      }
+    },
+    {
+      "id": "f1fd7d7f-bc32-5ea2-b9bc-754af57268d8",
+      "name": "Detalle publicaciones",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        220
+      ],
+      "parameters": {
+        "url": "=https://api.mercadolibre.com/items",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ids",
+              "value": "={{ $json.ids }}"
+            },
+            {
+              "name": "attributes",
+              "value": "id,title,status,sub_status,permalink,available_quantity,variations"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "db3eda38-6804-5484-978a-d6cbf31a762f",
+      "name": "Ventas de ayer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1580,
+        220
+      ],
+      "parameters": {
+        "url": "=https://api.mercadolibre.com/orders/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "seller",
+              "value": "={{ $('Config').first().json.SELLER_ID }}"
+            },
+            {
+              "name": "order.status",
+              "value": "paid"
+            },
+            {
+              "name": "order.date_created.from",
+              "value": "={{ $('Config').first().json.DESDE }}"
+            },
+            {
+              "name": "order.date_created.to",
+              "value": "={{ $('Config').first().json.HASTA }}"
+            },
+            {
+              "name": "sort",
+              "value": "date_desc"
+            },
+            {
+              "name": "limit",
+              "value": "50"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "offset",
+                    "value": "={{ $pageCount * 50 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.results || $response.body.results.length < 50 }}",
+              "limitPagesFetched": true,
+              "maxRequests": 40,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "fa37a24b-72b5-577b-ad85-3d2426bf01bf",
+      "name": "Unificar datos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        220
+      ],
+      "parameters": {
+        "jsCode": "// Junta lo que trajeron las llamadas a la API en un solo objeto con la misma forma que el modo demo.\nconst config = $('Config').first().json;\n\nconst items = $('Detalle publicaciones').all()\n  .map((i) => i.json)\n  .filter((r) => r.code === 200 && r.body)\n  .map((r) => r.body);\n\nconst orders = $('Ventas de ayer').all().flatMap((i) => i.json.results || []);\n\nreturn [{ json: { items, orders, config } }];\n"
+      }
+    },
+    {
+      "id": "b09a3835-0c59-5b80-ba4f-3b58f07a4ceb",
+      "name": "Analizar y armar email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2040,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// Lógica del reporte diario. Funciones puras: se testean con `node --test`\n// y el script build_workflow.py las incrusta en los nodos Code de n8n.\n\nconst TALLE_RE = /talle|size|tamaño/i;\n\n/** Nombre legible de una variante: el talle si existe, si no la combinación completa. */\nfunction nombreVariante(variacion) {\n  const attrs = variacion.attribute_combinations || [];\n  const talle = attrs.find((a) => TALLE_RE.test(a.name || '') || a.id === 'SIZE');\n  if (talle && talle.value_name) return String(talle.value_name);\n  const valores = attrs.map((a) => a.value_name).filter(Boolean);\n  return valores.length ? valores.join(' / ') : String(variacion.id);\n}\n\n/** Lista de variantes {nombre, stock} de una publicación (sin variaciones = una sola). */\nfunction variantesDe(item) {\n  const vars = item.variations || [];\n  if (vars.length === 0) {\n    return [{ nombre: '(única)', stock: Number(item.available_quantity) || 0 }];\n  }\n  return vars.map((v) => ({ nombre: nombreVariante(v), stock: Number(v.available_quantity) || 0 }));\n}\n\n/** Ordena talles numéricos de menor a mayor y el resto alfabéticamente. */\nfunction ordenarVariantes(a, b) {\n  const na = Number(a.nombre);\n  const nb = Number(b.nombre);\n  if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;\n  return a.nombre.localeCompare(b.nombre, 'es');\n}\n\n/**\n * Regla de reposición (definida por el negocio):\n * una publicación con varias variantes necesita recarga cuando\n * MIN_VARIANTES_BAJAS o más variantes tienen menos de UMBRAL_STOCK unidades.\n * Las publicaciones de variante única se informan aparte cuando llegan a 0.\n */\nfunction analizarStock(items, config) {\n  const umbral = Number(config.UMBRAL_STOCK);\n  const minBajas = Number(config.MIN_VARIANTES_BAJAS);\n  const alertas = [];\n  const sinStock = [];\n  let variantesTotales = 0;\n\n  for (const item of items) {\n    const variantes = variantesDe(item);\n    variantesTotales += variantes.length;\n\n    if (variantes.length === 1) {\n      if (variantes[0].stock === 0) {\n        sinStock.push({ id: item.id, titulo: item.title, permalink: item.permalink || '' });\n      }\n      continue;\n    }\n\n    const bajas = variantes.filter((v) => v.stock < umbral).sort(ordenarVariantes);\n    if (bajas.length >= minBajas) {\n      alertas.push({\n        id: item.id,\n        titulo: item.title,\n        permalink: item.permalink || '',\n        pausada: item.status === 'paused',\n        bajas,\n        sinStock: bajas.filter((v) => v.stock === 0).length,\n        totalVariantes: variantes.length,\n      });\n    }\n  }\n\n  // Primero las más urgentes: más variantes en 0, después más variantes bajas.\n  alertas.sort((a, b) => b.sinStock - a.sinStock || b.bajas.length - a.bajas.length || a.titulo.localeCompare(b.titulo, 'es'));\n  return { alertas, sinStock, publicaciones: items.length, variantes: variantesTotales };\n}\n\n/** Resumen de ventas de un conjunto de órdenes de Mercado Libre (solo las pagadas). */\nfunction analizarVentas(orders, topN = 5) {\n  const pagadas = orders.filter((o) => o.status === 'paid');\n  const porProducto = new Map();\n  let unidades = 0;\n  let monto = 0;\n  let moneda = 'ARS';\n\n  for (const orden of pagadas) {\n    if (orden.currency_id) moneda = orden.currency_id;\n    for (const linea of orden.order_items || []) {\n      const cantidad = Number(linea.quantity) || 0;\n      const subtotal = cantidad * (Number(linea.unit_price) || 0);\n      unidades += cantidad;\n      monto += subtotal;\n\n      const item = linea.item || {};\n      const variante = (item.variation_attributes || [])\n        .map((a) => a.value_name)\n        .filter(Boolean)\n        .join(' / ');\n      const clave = `${item.id}|${item.variation_id || ''}`;\n      const actual = porProducto.get(clave) || { titulo: item.title || item.id, variante, unidades: 0, monto: 0 };\n      actual.unidades += cantidad;\n      actual.monto += subtotal;\n      porProducto.set(clave, actual);\n    }\n  }\n\n  const top = [...porProducto.values()]\n    .sort((a, b) => b.unidades - a.unidades || b.monto - a.monto)\n    .slice(0, topN);\n\n  return { ordenes: pagadas.length, unidades, monto: Math.round(monto), moneda, top };\n}\n\nfunction analizar({ items, orders, config }) {\n  return {\n    fecha: config.FECHA_REPORTE,\n    fuente: config.DEMO_MODE ? 'demo' : 'mercadolibre',\n    config: { umbral: Number(config.UMBRAL_STOCK), minBajas: Number(config.MIN_VARIANTES_BAJAS) },\n    ventas: analizarVentas(orders),\n    stock: analizarStock(items, config),\n  };\n}\n\n// ---------- Email ----------\n\nfunction escapar(texto) {\n  return String(texto)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n}\n\nfunction formatearMonto(monto, moneda) {\n  try {\n    return new Intl.NumberFormat('es-AR', { style: 'currency', currency: moneda, maximumFractionDigits: 0 }).format(monto);\n  } catch (e) {\n    return `${moneda} ${Math.round(monto).toLocaleString('es-AR')}`;\n  }\n}\n\nfunction plural(n, uno, varios) {\n  return `${n} ${n === 1 ? uno : varios}`;\n}\n\nfunction enlace(titulo, permalink) {\n  const t = escapar(titulo);\n  return permalink ? `<a href=\"${escapar(permalink)}\" style=\"color:#1a56db;text-decoration:none\">${t}</a>` : t;\n}\n\nfunction armarEmail(r) {\n  const { ventas, stock } = r;\n  const recargar = stock.alertas.length;\n  const asunto = `Rremotos · ${r.fecha} · ${plural(ventas.unidades, 'unidad vendida', 'unidades vendidas')} · ` +\n    (recargar ? `${plural(recargar, 'publicación', 'publicaciones')} para recargar` : 'stock OK');\n\n  const th = 'style=\"text-align:left;padding:6px 8px;border-bottom:2px solid #ddd;font-size:13px;color:#555\"';\n  const thNum = 'style=\"text-align:right;padding:6px 8px;border-bottom:2px solid #ddd;font-size:13px;color:#555\"';\n  const td = 'style=\"padding:6px 8px;border-bottom:1px solid #eee;font-size:14px;vertical-align:top\"';\n  const tdNum = 'style=\"padding:6px 8px;border-bottom:1px solid #eee;font-size:14px;text-align:right;white-space:nowrap\"';\n\n  const filasTop = ventas.top.map((p) =>\n    `<tr><td ${td}>${escapar(p.titulo)}${p.variante ? `<br><span style=\"color:#777;font-size:12px\">${escapar(p.variante)}</span>` : ''}</td>` +\n    `<td ${tdNum}>${p.unidades}</td><td ${tdNum}>${formatearMonto(p.monto, ventas.moneda)}</td></tr>`).join('');\n\n  const filasAlertas = stock.alertas.map((a) => {\n    const detalle = a.bajas\n      .map((v) => `<span style=\"display:inline-block;margin:0 6px 4px 0;padding:2px 6px;border-radius:4px;background:${v.stock === 0 ? '#fde2e2' : '#fff4d6'};font-size:13px\">${escapar(v.nombre)}: <b>${v.stock}</b></span>`)\n      .join('');\n    const pausa = a.pausada ? ' <span style=\"color:#b42318;font-size:12px\">(pausada)</span>' : '';\n    return `<tr><td ${td}>${enlace(a.titulo, a.permalink)}${pausa}</td><td ${td}>${detalle}</td></tr>`;\n  }).join('');\n\n  const listaSinStock = stock.sinStock.map((s) => `<li style=\"margin-bottom:4px\">${enlace(s.titulo, s.permalink)}</li>`).join('');\n\n  const seccionVentas = ventas.ordenes === 0\n    ? '<p style=\"margin:0 0 8px\">Ayer no hubo ventas pagadas.</p>'\n    : `<p style=\"margin:0 0 12px;font-size:15px\"><b>${plural(ventas.unidades, 'unidad', 'unidades')}</b> en ${plural(ventas.ordenes, 'orden', 'órdenes')} · <b>${formatearMonto(ventas.monto, ventas.moneda)}</b></p>\n       <table cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;border-collapse:collapse\">\n         <tr><th ${th}>Más vendidos</th><th ${thNum}>Unid.</th><th ${thNum}>Total</th></tr>\n         ${filasTop}\n       </table>`;\n\n  const seccionAlertas = recargar === 0\n    ? `<p style=\"margin:0\">Ninguna publicación tiene ${r.config.minBajas} o más talles con menos de ${r.config.umbral} unidades.</p>`\n    : `<table cellspacing=\"0\" cellpadding=\"0\" style=\"width:100%;border-collapse:collapse\">\n         <tr><th ${th}>Publicación</th><th ${th}>Talles con stock bajo</th></tr>\n         ${filasAlertas}\n       </table>`;\n\n  const seccionSinStock = stock.sinStock.length\n    ? `<h3 style=\"font-size:15px;margin:20px 0 8px\">Sin stock (variante única)</h3><ul style=\"margin:0;padding-left:18px\">${listaSinStock}</ul>`\n    : '';\n\n  const avisoDemo = r.fuente === 'demo'\n    ? '<p style=\"margin:0 0 16px;padding:8px 10px;background:#eef2ff;border-radius:6px;font-size:13px\">Modo demo: datos ficticios, sin conexión a Mercado Libre.</p>'\n    : '';\n\n  const html = `<!doctype html><html><body style=\"margin:0;padding:16px;background:#f6f6f6;font-family:Arial,Helvetica,sans-serif;color:#222\">\n  <div style=\"max-width:640px;margin:0 auto;background:#fff;border-radius:8px;padding:20px\">\n    <h2 style=\"margin:0 0 4px;font-size:20px\">Reporte diario · Rremotos</h2>\n    <p style=\"margin:0 0 16px;color:#666;font-size:13px\">Ventas del ${escapar(r.fecha)} · stock de ${plural(stock.publicaciones, 'publicación', 'publicaciones')} (${stock.variantes} variantes)</p>\n    ${avisoDemo}\n    <h3 style=\"font-size:16px;margin:0 0 8px\">Ventas de ayer</h3>\n    ${seccionVentas}\n    <h3 style=\"font-size:16px;margin:24px 0 4px\">Para recargar${recargar ? ` (${recargar})` : ''}</h3>\n    <p style=\"margin:0 0 10px;color:#666;font-size:12px\">Publicaciones con ${r.config.minBajas} o más talles con menos de ${r.config.umbral} unidades. En rojo, los talles en 0.</p>\n    ${seccionAlertas}\n    ${seccionSinStock}\n  </div></body></html>`;\n\n  const lineas = [\n    `Reporte diario Rremotos · ventas del ${r.fecha}`,\n    ventas.ordenes === 0\n      ? 'Ayer no hubo ventas pagadas.'\n      : `${plural(ventas.unidades, 'unidad', 'unidades')} en ${plural(ventas.ordenes, 'orden', 'órdenes')} · ${formatearMonto(ventas.monto, ventas.moneda)}`,\n    ...ventas.top.map((p) => `  - ${p.titulo}${p.variante ? ` (${p.variante})` : ''}: ${p.unidades}`),\n    '',\n    recargar ? `Para recargar (${recargar}):` : 'Stock OK: nada para recargar.',\n    ...stock.alertas.map((a) => `  - ${a.titulo}${a.pausada ? ' [pausada]' : ''}: ${a.bajas.map((v) => `${v.nombre}=${v.stock}`).join(', ')}`),\n    ...(stock.sinStock.length ? ['', 'Sin stock (variante única):', ...stock.sinStock.map((s) => `  - ${s.titulo}`)] : []),\n  ];\n\n  return { asunto, html, texto: lineas.join('\\n') };\n}\n\n// ---------- Datos demo ----------\n\n/** Generador pseudoaleatorio con semilla: el demo da siempre el mismo resultado para la misma fecha. */\nfunction crearRandom(semilla) {\n  let s = semilla >>> 0;\n  return () => {\n    s = (s * 1664525 + 1013904223) >>> 0;\n    return s / 4294967296;\n  };\n}\n\nfunction semillaDeFecha(fecha) {\n  return [...String(fecha)].reduce((acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 7);\n}\n\nfunction datosDemo(fecha) {\n  const rnd = crearRandom(semillaDeFecha(fecha));\n  const modelos = ['410', '512', '618', '733', '805', '920'];\n  const colores = ['NEGRO', 'BLANCO', 'AZUL', 'GRIS'];\n  const talles = ['35', '36', '37', '38', '39', '40', '41', '42', '43'];\n  const items = [];\n  let itemN = 1000001;\n  let varN = 5000001;\n\n  for (const modelo of modelos) {\n    for (const color of colores.slice(0, 2 + Math.floor(rnd() * 3))) {\n      const tallesPub = talles.filter(() => rnd() > 0.25);\n      const variations = tallesPub.map((talle) => {\n        // La mayoría arranca en 2 (stock base del negocio); algunas bajan a 1 o 0.\n        const r = rnd();\n        const stock = r < 0.05 ? 0 : r < 0.13 ? 1 : r < 0.9 ? 2 : 3;\n        return {\n          id: varN++,\n          available_quantity: stock,\n          attribute_combinations: [\n            { id: 'COLOR', name: 'Color', value_name: color[0] + color.slice(1).toLowerCase() },\n            { id: 'SIZE', name: 'Talle', value_name: talle },\n          ],\n        };\n      });\n      const total = variations.reduce((s, v) => s + v.available_quantity, 0);\n      items.push({\n        id: `MLA${itemN++}`,\n        title: `Zapatilla ${modelo} ${color}`,\n        status: total === 0 ? 'paused' : 'active',\n        permalink: '',\n        available_quantity: total,\n        variations,\n      });\n    }\n  }\n\n  // Dos publicaciones sin variaciones (accesorios) para cubrir ese caso.\n  items.push({ id: `MLA${itemN++}`, title: 'Plantillas de gel', status: 'active', permalink: '', available_quantity: 4, variations: [] });\n  items.push({ id: `MLA${itemN++}`, title: 'Cordones planos x2', status: 'paused', permalink: '', available_quantity: 0, variations: [] });\n\n  const conVariaciones = items.filter((i) => i.variations.length);\n  const orders = [];\n  const cantidadOrdenes = 6 + Math.floor(rnd() * 10);\n  for (let n = 0; n < cantidadOrdenes; n++) {\n    const item = conVariaciones[Math.floor(rnd() * conVariaciones.length)];\n    const v = item.variations[Math.floor(rnd() * item.variations.length)];\n    orders.push({\n      id: 2000000000 + n,\n      status: rnd() < 0.9 ? 'paid' : 'cancelled',\n      currency_id: 'ARS',\n      order_items: [{\n        item: { id: item.id, title: item.title, variation_id: v.id, variation_attributes: v.attribute_combinations },\n        quantity: rnd() < 0.85 ? 1 : 2,\n        unit_price: 38000 + Math.floor(rnd() * 8) * 2500,\n      }],\n    });\n  }\n\n  return { items, orders };\n}\n\nif (typeof module !== 'undefined' && module.exports) {\n  module.exports = { nombreVariante, variantesDe, analizarStock, analizarVentas, analizar, armarEmail, datosDemo };\n}\n\n// ---------- Nodo ----------\nconst { items, orders, config } = $input.first().json;\nconst resumen = analizar({ items, orders, config });\nconst email = armarEmail(resumen);\n\nreturn [{\n  json: {\n    asunto: email.asunto,\n    texto: email.texto,\n    html: email.html,\n    destino: config.EMAIL_DESTINO,\n    remitente: config.EMAIL_REMITENTE,\n    enviar: config.ENVIAR_EMAIL,\n    resumen,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "50433f1c-83ef-5baa-ba40-34d37ea43895",
+      "name": "¿Enviar email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2260,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bf57e137-55b1-5101-856c-085b7bc219a5",
+              "leftValue": "={{ $json.enviar }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "d8b7928e-b009-5a5d-a3eb-6ce67c37814f",
+      "name": "Enviar email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2480,
+        0
+      ],
+      "parameters": {
+        "fromEmail": "={{ $json.remitente }}",
+        "toEmail": "={{ $json.destino }}",
+        "subject": "={{ $json.asunto }}",
+        "emailFormat": "both",
+        "text": "={{ $json.texto }}",
+        "html": "={{ $json.html }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Todos los días 14:00": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ejecutar a mano": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "¿Modo demo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Modo demo?": {
+      "main": [
+        [
+          {
+            "node": "Datos demo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Estados a consultar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Datos demo": {
+      "main": [
+        [
+          {
+            "node": "Analizar y armar email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Estados a consultar": {
+      "main": [
+        [
+          {
+            "node": "Buscar publicaciones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Buscar publicaciones": {
+      "main": [
+        [
+          {
+            "node": "Lotes de 20",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lotes de 20": {
+      "main": [
+        [
+          {
+            "node": "Detalle publicaciones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detalle publicaciones": {
+      "main": [
+        [
+          {
+            "node": "Ventas de ayer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ventas de ayer": {
+      "main": [
+        [
+          {
+            "node": "Unificar datos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unificar datos": {
+      "main": [
+        [
+          {
+            "node": "Analizar y armar email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analizar y armar email": {
+      "main": [
+        [
+          {
+            "node": "¿Enviar email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Enviar email?": {
+      "main": [
+        [
+          {
+            "node": "Enviar email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Argentina/Buenos_Aires"
+  },
+  "pinData": {},
+  "tags": []
+}
